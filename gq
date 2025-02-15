@@ -1,0 +1,933 @@
+#!/usr/bin/env bash
+
+# This script uses $HOME to reference the user's home directory
+# This allows the script to work for any user, not just gqadmin
+
+###############################################################################
+#
+# Usage:
+#   gq <operation> [dev-mode] [build-options] [log-options]
+#
+# Operations:
+#   -a, --auth           Generate SSH key for Git authentication
+#   -i, --init           Install dependencies
+#   -sg, --setup-gotrade  Setup GoTrade environment
+#   -up, --start         Start all services
+#   -r, --run-oems       Run OEMS only
+#   -down, --stop        Stop all services
+#   clone [repo]         Clone repository (default: gq-cli or specified repo)
+#
+# Development Modes (use with -up):
+#   -rd, --remote-dev    Run OEMS in remote-dev mode
+#   -s,  --standard-dev  Run OEMS in standard-dev mode
+#   -f,  --full-stack    Run full stack in default mode
+#
+# Build Options (use with -up only):
+#   -c, --compile-oems   Toggle OEMS compilation
+#   -g, --build-gq       Toggle GQ packages build (NOT allowed for remote-dev)
+#   -w, --reset           Toggle data reset
+#   -bf, --build-frontend Toggle frontend build
+#
+# Log Options:
+#   -loem1, --log-oems1     Toggle OEMS1 logs
+#   -loem2, --log-oems2     Toggle OEMS2 logs
+#   -lapi, --log-fastapi   Toggle FastAPI logs
+#   -lui, --log-frontend  Toggle frontend logs
+#
+# Examples:
+#   gq -i
+#   gq --auth
+#   gq -sg
+#   gq clone gq-deribit-gateway-cpp    # Clone the repo using the name"
+
+#   remote dev mode - run only oems in remote dev only
+#   gq -rd -c        # Compile and run OEMS in remote-dev mode
+#   gq -rd -r        # Run existing OEMS executable in remote-dev mode
+#   gq -up -f             # Start full stack
+#   gq -up -f -bf -lapi -lui -loem1   # Start full stack with all builds
+#   gq -down
+#   standard dev mode - run the oems only
+#   gq -up -s             # Just run existing OEMS executable
+#   gq -up -s -c          # Compile and run OEMS
+#   gq -up -s -g          # Build GQ packages and run OEMS
+#   gq -up -s -g -c       # Build GQ packages, compile OEMS, then run it
+#   gq -up -s -loem1         # Run OEMS with logging enabled
+#   gq -up -s -c -loem1      # Compile and run OEMS with logging enabled
+###############################################################################
+
+set -e  # exit immediately if a command exits with a non-zero status
+
+PID_FILE="process_manager.pid"
+TRAP_SET=false
+
+# -----------------------------------------------------------------------------
+# Cleanup function for proper shutdown
+# -----------------------------------------------------------------------------
+cleanup() {
+    if [[ "$TRAP_SET" == "false" ]]; then
+        return
+    fi
+    echo -e "\nReceived shutdown signal. Cleaning up..."
+    
+    # Kill all background processes in our process group
+    pkill -P $$ || true
+    
+    # Stop all services
+    stop_all_services
+    
+    # Reset signal handling to default
+    trap - SIGINT SIGTERM
+    TRAP_SET=false
+    
+    echo "Cleanup complete"
+    exit 0
+}
+
+# Set up signal trapping
+trap cleanup SIGINT SIGTERM
+TRAP_SET=true
+
+# -----------------------------------------------------------------------------
+# Helper: Print usage
+# -----------------------------------------------------------------------------
+usage() {
+    echo "Usage: gq <operation> [dev-mode] [build-options] [log-options]"
+    echo ""
+    echo "Operations:"
+    echo "    -a,  --auth            Generate SSH key for Git authentication"
+    echo "    -i,  --init            Install dependencies"
+    echo "    -sg, --setup-gotrade   Setup GoTrade environment"
+    echo "    -up, --start           Start all services"
+    echo "    -down, --stop          Stop all services"
+    echo "    -r,  --run-oems        Run OEMS only"
+    echo "    clone [repo]         Clone repository"
+    echo ""
+    echo "Development Modes (use with -up):"
+    echo "    -rd, --remote-dev      Run OEMS in remote-dev mode"
+    echo "    -s,  --standard-dev    Run OEMS in standard-dev mode"
+    echo "    -f,  --full-stack      Run full stack in default mode"
+    echo ""
+    echo "Build Options (use with -up only):"
+    echo "    -c,  --compile-oems    Toggle OEMS compilation"
+    echo "    -g,  --build-gq        Toggle GQ packages build (NOT allowed for remote-dev)"
+    echo "    -w,  --reset           Toggle data wiping"
+    echo "    -bf, --build-frontend  Toggle frontend build"
+    echo ""
+    echo "Log Options:"
+    echo "    -loem1, --log-oems1    Toggle OEMS1 logs"
+    echo "    -loem2, --log-oems2    Toggle OEMS2 logs"
+    echo "    -lapi,  --log-fastapi  Toggle FastAPI logs"
+    echo "    -lui,   --log-frontend Toggle frontend logs"
+    echo ""
+    echo "Examples:"
+    echo "    Basic Operations:"
+    echo "    gq -i                              # Install dependencies"
+    echo "    gq --auth                          # Generate SSH key"
+    echo "    gq -sg                             # Setup GoTrade environment"
+    echo "    gq clone gq-deribit-gateway-cpp    # Clone the repo using the name"
+    echo ""
+    echo "    Remote Dev Mode (OEMS only):"
+    echo "    gq -rd -c                          # Compile and run OEMS in remote-dev mode"
+    echo "    gq -rd -r                          # Run existing OEMS executable in remote-dev mode"
+    echo ""
+    echo "    Full Stack Mode:"
+    echo "    gq -up -f                          # Start full stack"
+    echo "    gq -up -f -bf -lapi -lui -loem1    # Start full stack with builds and logging"
+    echo "    gq -down                           # Stop all services"
+    echo ""
+    echo "    Standard Dev Mode (OEMS only):"
+    echo "    gq -up -s                          # Just run existing OEMS executable"
+    echo "    gq -up -s -c                       # Compile and run OEMS"
+    echo "    gq -up -s -g                       # Build GQ packages and run OEMS"
+    echo "    gq -up -s -g -c                    # Build GQ packages, compile OEMS, then run it"
+    echo "    gq -up -s -loem1                   # Run OEMS with logging enabled"
+    echo "    gq -up -s -c -loem1                # Compile and run OEMS with logging enabled"
+    exit 1
+}
+
+# -----------------------------------------------------------------------------
+# If no arguments, print a brief message and exit
+# -----------------------------------------------------------------------------
+if [[ $# -eq 0 ]]; then
+  echo ""
+  echo "Use gq <operation> [service] [dev-mode] [build-options] [log-options] or gq --help for more information"
+  echo ""
+  exit 1
+fi
+
+# -----------------------------------------------------------------------------
+# Default toggles. Overridden by CLI flags
+# -----------------------------------------------------------------------------
+OEMS1_LOGS=false
+OEMS2_LOGS=false
+FASTAPI_LOGS=false
+FRONTEND_LOGS=false
+
+COMPILE_OEMS=false
+BUILD_GQ_PACKAGES=false
+RESET_DATA=false
+BUILD_FRONTEND=false
+
+DEV_MODE=""
+OPERATION=""
+
+# -----------------------------------------------------------------------------
+# Parse Arguments
+# -----------------------------------------------------------------------------
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage
+      ;;
+    -i|--init)
+      OPERATION="init"
+      shift
+      ;;
+    -up|--start)
+      OPERATION="start"
+      shift
+      ;;
+    -a|--auth)
+      OPERATION="auth"
+      shift
+      ;;
+    -down|--stop)
+      OPERATION="stop"
+      shift
+      ;;
+    -rd|--remote-dev)
+      DEV_MODE="remote-dev"
+      shift
+      ;;
+    -s|--standard-dev)
+      DEV_MODE="standard-dev"
+      shift
+      ;;
+    -c|--compile-oems)
+      if [[ -z "$OPERATION" ]]; then
+        OPERATION="compile"
+      fi
+      COMPILE_OEMS=true
+      shift
+      ;;
+    -g|--build-gq)
+      BUILD_GQ_PACKAGES=true
+      shift
+      ;;
+    -w|--reset)
+      RESET_DATA=true
+      shift
+      ;;
+    -bf|--build-frontend)
+      BUILD_FRONTEND=true
+      shift
+      ;;
+    -loem1|--log-oems1)
+      OEMS1_LOGS=true
+      shift
+      ;;
+    -loem2|--log-oems2)
+      OEMS2_LOGS=true
+      shift
+      ;;
+    -f|--full-stack)
+      DEV_MODE="full-stack"
+      shift
+      ;;
+    -lapi|--log-fastapi)
+      FASTAPI_LOGS=true
+      shift
+      ;;
+    -lui|--log-frontend)
+      FRONTEND_LOGS=true
+      shift
+      ;;
+    -sg|--setup-gotrade)
+      OPERATION="setup-gotrade"
+      shift
+      ;;
+    -r|--run-oems)
+      OPERATION="run"
+      shift
+      ;;
+    clone)
+        OPERATION="clone"
+        shift
+        if [ $# -eq 0 ]; then
+            echo -e "${RED}Error:${RESET_COLOR} No repository specified"
+            echo "Usage: gq clone <repo1> [repo2 ...]"
+            exit 1
+        fi
+        REPO_NAMES=("$@")
+        break
+        ;;
+
+    *)
+      echo "Unknown argument: $1"
+      usage
+      ;;
+  esac
+done
+
+# -----------------------------------------------------------------------------
+# Generate SSH Key for Git Authentication
+# -----------------------------------------------------------------------------
+generate_ssh_key() {
+    echo "Generating SSH key for Git authentication..."
+    read -p "Enter your email address for the SSH key: " email
+    ssh-keygen -t rsa -b 4096 -C "$email" -f ~/.ssh/id_rsa
+    eval "$(ssh-agent -s)"
+    ssh-add ~/.ssh/id_rsa
+    echo -e "\nYour public SSH key has been generated. Add this key to your Git account:"
+    echo -e "\n------- Begin SSH Public Key -------"
+    cat ~/.ssh/id_rsa.pub
+    echo -e "------- End SSH Public Key -------\n"
+    echo "Instructions:"
+    echo "1. Copy the above public key"
+    echo "2. Go to your Git account settings"
+    echo "3. Find 'SSH and GPG keys' or similar"
+    echo "4. Click 'New SSH key' or 'Add SSH key'"
+    echo "5. Paste your key and save"
+    
+    read -p $'\nHave you added the SSH key to your Git account? (y/N): ' response
+    if [[ "$response" =~ ^[Yy]$ ]]; then
+        echo -e "\nTesting SSH connection to GitHub..."
+        ssh -T git@github.com
+    else
+        echo -e "\nSkipping connection test. Run 'ssh -T git@github.com' after adding your key to test the connection."
+    fi
+}
+
+
+# -----------------------------------------------------------------------------
+# Clone repository function
+# -----------------------------------------------------------------------------
+clone_repository() {
+    if [ $# -eq 0 ]; then
+        echo -e "${RED}Error:${RESET_COLOR} No repository specified"
+        echo "Usage: gq clone <repo1> [repo2 ...] or gq clone <git_url>"
+        exit 1
+    fi
+
+    echo -e "\n${CYAN}Checking SSH connection to GitHub...${RESET_COLOR}"
+    if ! ssh -T git@github.com 2>&1 | grep -q "successfully authenticated"; then
+        echo -e "${RED}Error: SSH connection to GitHub failed.${RESET_COLOR}"
+        echo -e "${YELLOW}Please ensure you have:${RESET_COLOR}"
+        echo "1. Generated and added your SSH key to GitHub (use 'gq auth')"
+        echo "2. Your SSH key is properly configured"
+        exit 1
+    fi
+
+    echo -e "${GREEN}SSH connection successful. Proceeding with clone...${RESET_COLOR}\n"
+    
+    # Change to the home directory first
+    cd "$HOME" || {
+        echo -e "${RED}Error: Cannot access $HOME directory${RESET_COLOR}"
+        exit 1
+    }
+    
+    # Clone each specified repository
+    for repo in "$@"; do
+        # Get the repository name from the URL or use the provided name
+        if [[ $repo == *"git@"* || $repo == *"https://"* ]]; then
+            local repo_url="$repo"
+            local repo_name=$(basename "$repo" .git)
+        else
+            local repo_url="git@github.com:GoQuant-Technologies-Inc/${repo}.git"
+            local repo_name="$repo"
+        fi
+
+        # Check if directory already exists
+        if [ -d "$HOME/${repo_name}" ]; then
+            echo -e "${RED}✗ Error: Directory ${YELLOW}$HOME/${repo_name}${RED} already exists${RESET_COLOR}"
+            echo -e "${YELLOW}Please remove or rename the existing directory first${RESET_COLOR}"
+            echo ""
+            continue
+        fi
+
+        echo -e "${CYAN}Cloning ${YELLOW}${repo_name}${CYAN} to ${YELLOW}$HOME/${repo_name}${CYAN}...${RESET_COLOR}"
+        if git clone "$repo_url"; then
+            echo -e "\n${GREEN}✓ Successfully cloned ${YELLOW}${repo_name}${GREEN} to ${YELLOW}$HOME/${repo_name}${RESET_COLOR}"
+        else
+            echo -e "\n${RED}✗ Failed to clone ${YELLOW}${repo_name}${RESET_COLOR}"
+            echo -e "${YELLOW}Please check if the repo name is correct and have necessary permissions to clone this repository${RESET_COLOR}"
+            echo -e "${YELLOW}Contact your administrator if you need access${RESET_COLOR}"
+        fi
+        echo ""
+    done
+}
+
+
+# -----------------------------------------------------------------------------
+# Validate we have an operation
+# -----------------------------------------------------------------------------
+if [[ -z "$OPERATION" ]]; then
+  echo "Error: No operation specified. Choose from -i, -p, -up, or -down."
+  usage
+fi
+
+# -----------------------------------------------------------------------------
+# Colors for prefix
+# -----------------------------------------------------------------------------
+RESET_COLOR="\033[0m"
+BLUE="\033[1;34m"
+GREEN="\033[1;32m"
+PURPLE="\033[1;35m"
+CYAN="\033[1;36m"
+RED="\033[0;31m"
+YELLOW="\033[0;33m"
+# -----------------------------------------------------------------------------
+# prefix_output: Prefix logs with color, process name, and timestamp
+# -----------------------------------------------------------------------------
+prefix_output() {
+    local prefix="$1"
+    local color=""
+    case "$prefix" in
+        "OEMS1")    color="$BLUE" ;;
+        "OEMS2")    color="$GREEN" ;;
+        "FASTAPI")  color="$PURPLE" ;;
+        "FRONTEND") color="$CYAN" ;;
+        *)          color="$RESET_COLOR" ;;
+    esac
+    while IFS= read -r line; do
+        echo -e "${color}[$(date '+%Y-%m-%d %H:%M:%S')] [$prefix]${RESET_COLOR} $line"
+    done
+}
+
+# -----------------------------------------------------------------------------
+# Start sub-processes
+# -----------------------------------------------------------------------------
+start_oems1() {
+    (
+        # Build GQ packages if requested
+        if [[ "$BUILD_GQ_PACKAGES" == "true" ]]; then
+            echo "Building GQ Conan packages..."
+            cd "$HOME/gq-dev-v3-cpp" || { echo "Directory gq-dev-v3-cpp not found."; exit 1; }
+            ./sba_setup.sh || { echo "Failed to run sba_setup.sh"; exit 1; }
+            cd ..
+        fi
+
+        # Handle different dev modes
+        if [[ "$DEV_MODE" == "remote-dev" ]]; then
+            start_remote_dev "$COMPILE_OEMS"
+        elif [[ "$DEV_MODE" == "standard-dev" || "$DEV_MODE" == "full-stack" ]]; then
+            cd "$HOME/gq-gotrade-cpp" || { echo "Directory gq-gotrade-cpp not found."; exit 1; }
+            source venv/bin/activate
+            
+            # Start docker containers
+            echo "Starting Docker containers..."
+            docker compose -f docker-compose.yml up -d
+            docker compose -f docker-compose-1.yml up -d
+
+            if [[ "$COMPILE_OEMS" == "true" ]]; then
+                echo "Compiling OEMS in standard-dev mode..."
+                ./run.sh || { echo "Failed to run compilation script"; exit 1; }
+            else
+                echo "Running existing OEMS executable..."
+                cd oms || { echo "Directory gq-gotrade-cpp/oms not found."; exit 1; }
+                if [[ -x "builddir/oms_exe" ]]; then
+                    trap 'exit' SIGINT SIGTERM  # Ensure signals are caught
+                    exec ./builddir/oms_exe
+                else
+                    echo "Error: oms_exe is not executable or doesn't exist"
+                    echo "Try running with -c flag to compile first"
+                    exit 1
+                fi
+            fi
+        else
+            echo "Error: Invalid dev mode specified"
+            exit 1
+        fi
+    )
+}
+
+start_oems2() {
+    (
+        # Copy executable from build directory, then run it
+        cp "$HOME/gq-gotrade-cpp/oms/builddir/oms_exe" cpp_exe/oms_exe || {
+          echo "Failed to copy oms_exe"; exit 1;
+        }
+        # chmod +x cpp_exe/oms_exe
+        # cd cpp_exe || { echo "Directory cpp_exe not found."; exit 1; }
+        # ./oms_exe
+    )
+}
+
+start_fastapi() {
+    (
+        cd "$HOME/gotrade" || { echo "Directory gotrade not found."; exit 1; }
+
+        if [[ "$RESET_DATA" == "true" ]]; then
+          echo "Wiping data and spinning down DB container..."
+          docker compose -f docker-compose.db.yml down
+          sudo rm -rf data
+        fi
+
+        echo "Starting database container..."
+        docker compose -f docker-compose.db.yml up -d
+
+        echo "Starting FastAPI..."
+        cd fastapi || { echo "Directory gotrade/fastapi not found."; exit 1; }
+        source venv/bin/activate
+        poetry run uvicorn gotrade.src.main:app --host 0.0.0.0 --port 8001 --reload
+    )
+}
+
+start_frontend() {
+    (
+        cd "$HOME/gotrade/frontend/apps/gotrade" || {
+          echo "Directory gotrade/frontend/apps/gotrade not found.";
+          exit 1;
+        }
+
+        if [[ "$BUILD_FRONTEND" == "true" ]]; then
+          echo "Building frontend..."
+          bun run build
+        fi
+
+        echo "Starting frontend..."
+        bun run start
+    )
+}
+
+
+setup_gotrade() {
+    echo "Setting up Gotrade environment..."
+
+    # FastAPI Setup
+    echo "Setting up FastAPI..."
+    cd "$HOME/gotrade/fastapi" || {
+        echo "Error: Directory gotrade/fastapi not found."
+        exit 1
+    }
+
+    # Check if virtual environment exists
+    if [ ! -d "venv" ]; then
+        echo "Creating virtual environment..."
+        python3 -m venv venv || {
+            echo "Error: Failed to create virtual environment"
+            exit 1
+        }
+        echo "Virtual environment created successfully!"
+        
+        # Activate the new virtual environment
+        source venv/bin/activate || {
+            echo "Error: Failed to activate virtual environment"
+            exit 1
+        }
+        
+        # Install FastAPI and poetry
+        echo "Installing FastAPI and poetry..."
+        pip install fastapi || {
+            echo "Error: Failed to install FastAPI"
+            exit 1
+        }
+        pip install poetry || {
+            echo "Error: Failed to install poetry"
+            exit 1
+        }
+        
+        # Run poetry install
+        echo "Running poetry install..."
+        poetry install || {
+            echo "Error: Failed to run poetry install"
+            exit 1
+        }
+    else
+        echo "Virtual environment already exists"
+        
+        # Activate existing virtual environment
+        source venv/bin/activate || {
+            echo "Error: Failed to activate virtual environment"
+            exit 1
+        }
+        
+        # Install poetry and run poetry install
+        echo "Installing poetry and running poetry install..."
+        pip install poetry || {
+            echo "Error: Failed to install poetry"
+            exit 1
+        }
+        poetry install || {
+            echo "Error: Failed to run poetry install"
+            exit 1
+        }
+    fi
+    
+    # Deactivate virtual environment
+    deactivate
+    echo "FastAPI setup completed successfully!"
+
+    # Frontend Setup
+    echo "Setting up Frontend..."
+    cd ../frontend/apps/gotrade || {
+        echo "Error: Directory gotrade/frontend/apps/gotrade not found."
+        exit 1
+    }
+
+    # Install bun dependencies
+    echo "Installing bun dependencies..."
+    bun i || {
+        echo "Error: Failed to install bun dependencies"
+        exit 1
+    }
+    echo "Frontend setup completed successfully!"
+
+    echo "Gotrade setup completed successfully!"
+}
+
+
+run_oems() {
+    echo "Starting OEMS..."
+    
+    # Navigate to the directory
+    cd "$HOME/gq-gotrade-cpp" || { echo "Error: gq-gotrade-cpp directory not found"; exit 1; }
+    
+    # Start Docker containers
+    echo "Starting Docker containers..."
+    docker compose -f docker-compose.yml up -d || { echo "Error starting docker-compose.yml"; exit 1; }
+    docker compose -f docker-compose-1.yml up -d || { echo "Error starting docker-compose-1.yml"; exit 1; }
+    
+    source venv/bin/activate
+
+    # If in remote-dev mode and compilation requested
+    if [[ "$DEV_MODE" == "remote-dev" && "$COMPILE_OEMS" == "true" ]]; then
+        echo "Compiling and running OEMS in remote-dev mode..."
+        ./remote-dev.sh || { echo "Error running remote-dev.sh"; exit 1; }
+    # If in remote-dev mode and just running
+    elif [[ "$DEV_MODE" == "remote-dev" && "$OPERATION" == "run" ]]; then
+        cd oms || { echo "Error: oms directory not found"; exit 1; }
+        echo "Running existing OEMS executable in remote-dev mode..."
+        ./builddir/oms_exe
+    else
+        cd oms || { echo "Error: oms directory not found"; exit 1; }
+        echo "Running existing OEMS executable..."
+        ./builddir/oms_exe
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Arrays to hold PIDs of background processes, and the start function
+# -----------------------------------------------------------------------------
+PIDS=()
+
+
+start_services() {
+    if [[ "$DEV_MODE" == "standard-dev" ]]; then
+        start_oems_only
+    else
+        start_full_stack
+    fi
+
+    # Write PIDs to file
+    echo "Writing PIDs to $PID_FILE..."
+    printf "%s\n" "${PIDS[@]}" > "$PID_FILE"
+    echo "Services started. PID file saved to $PID_FILE."
+
+    # Exit so user regains their terminal
+    exit 0
+}
+
+start_oems_only() {
+    echo "Starting OEMS in standard-dev mode..."
+    
+    if [[ "$OEMS1_LOGS" == "true" ]]; then
+        echo "Starting OEMS with logging..."
+        start_oems1 | prefix_output "OEMS1" &
+    else
+        echo "Starting OEMS (no logs)..."
+        start_oems1 > /dev/null 2>&1 &
+    fi
+    PIDS+=($!)
+
+    # Wait for the OEMS process
+    wait
+}
+
+start_full_stack() {
+    echo "Starting full stack in sequential order..."
+    
+    # Step 1: Start OEMS
+    echo "Step 1: Starting OEMS..."
+    if [[ "$OEMS1_LOGS" == "true" ]]; then
+        start_oems1 | prefix_output "OEMS1" &
+        OEMS_PID=$!
+    else
+        start_oems1 > /dev/null 2>&1 &
+        OEMS_PID=$!
+    fi
+    PIDS+=($OEMS_PID)
+    
+    # Wait for OEMS to start properly
+    echo "Waiting for OEMS to initialize..."
+    sleep 5  # Adjust this value based on your system's needs
+    
+    # Check if OEMS is running
+    if ! kill -0 $OEMS_PID 2>/dev/null; then
+        echo "Error: OEMS failed to start properly"
+        exit 1
+    fi
+    
+    # Step 2: Start FastAPI
+    echo "Step 2: Starting FastAPI..."
+    if [[ "$FASTAPI_LOGS" == "true" ]]; then
+        start_fastapi | prefix_output "FASTAPI" &
+        FASTAPI_PID=$!
+    else
+        start_fastapi > /dev/null 2>&1 &
+        FASTAPI_PID=$!
+    fi
+    PIDS+=($FASTAPI_PID)
+    
+    # Wait for FastAPI to start
+    echo "Waiting for FastAPI to initialize..."
+    sleep 5  # Adjust this value based on your system's needs
+    
+    # Check if FastAPI is running
+    if ! kill -0 $FASTAPI_PID 2>/dev/null; then
+        echo "Error: FastAPI failed to start properly"
+        exit 1
+    fi
+    
+    # Step 3: Start Frontend
+    echo "Step 3: Starting Frontend..."
+    if [[ "$FRONTEND_LOGS" == "true" ]]; then
+        start_frontend | prefix_output "FRONTEND" &
+        FRONTEND_PID=$!
+    else
+        start_frontend > /dev/null 2>&1 &
+        FRONTEND_PID=$!
+    fi
+    PIDS+=($FRONTEND_PID)
+    
+    echo "All services started successfully in sequence."
+    echo "  - OEMS PID: $OEMS_PID"
+    echo "  - FastAPI PID: $FASTAPI_PID"
+    echo "  - Frontend PID: $FRONTEND_PID"
+    
+    # Wait for all processes
+    wait
+}
+
+# -----------------------------------------------------------------------------
+# Remote Dev function
+# -----------------------------------------------------------------------------
+
+
+
+start_remote_dev() {
+    local compile_flag="$1"
+    
+    echo "Starting remote development environment..."
+    
+    # Navigate to the directory
+    cd "$HOME/gq-gotrade-cpp" || { echo "Error: gq-gotrade-cpp directory not found"; exit 1; }
+    
+    # Check if we need to compile
+    if [[ ! -f "oms/builddir/oms_exe" ]]; then
+        echo "OMS executable not found in oms/builddir/"
+        read -p "Would you like to compile OMS? (y/N): " should_compile
+        if [[ "$should_compile" =~ ^[Yy]$ ]]; then
+            compile_flag="true"
+        else
+            echo "Error: Cannot proceed without OMS executable"
+            exit 1
+        fi
+    fi
+    
+    # Start Docker containers
+    echo "Starting Docker containers..."
+    docker compose -f docker-compose.yml up -d || { echo "Error starting docker-compose.yml"; exit 1; }
+    docker compose -f docker-compose-1.yml up -d || { echo "Error starting docker-compose-1.yml"; exit 1; }
+    
+    # Activate virtual environment if it exists
+    if [[ -d "venv" ]]; then
+        source venv/bin/activate || { echo "Error activating virtual environment"; exit 1; }
+    else
+        echo "Warning: Virtual environment not found in gq-gotrade-cpp/venv"
+    fi
+    
+    # Handle compilation or direct execution
+    if [[ "$compile_flag" == "true" ]]; then
+        echo "Compiling OMS..."
+        ./remote-dev.sh || { echo "Error running remote-dev.sh"; exit 1; }
+    else
+        echo "Using existing OMS executable..."
+        cd oms || { echo "Error: oms directory not found"; exit 1; }
+        if [[ -x "builddir/oms_exe" ]]; then
+            ./builddir/oms_exe
+        else
+            echo "Error: oms_exe is not executable"
+            echo "Try running: chmod +x builddir/oms_exe"
+            exit 1
+        fi
+    fi
+}
+
+# Usage example:
+# start_remote_dev true  # Force compilation
+# start_remote_dev false # Use existing executable if available
+
+
+
+# -----------------------------------------------------------------------------
+# Stop function reads from PID file, kills processes, then docker-compose down
+# -----------------------------------------------------------------------------
+stop_all_services() {
+    echo "Stopping all services..."
+    echo "------------------------"
+
+    # Kill processes first
+    local processes_to_kill=("uvicorn" "oms_exe")
+    
+    # Handle PIDs from PID file
+    if [[ -f "$PID_FILE" ]]; then
+        echo "Reading PIDs from $PID_FILE..."
+        mapfile -t pids < "$PID_FILE"
+        
+        # First try graceful termination
+        for pid in "${pids[@]}"; do
+            if kill -0 "$pid" 2>/dev/null; then
+                echo "Sending SIGTERM to PID $pid..."
+                kill "$pid" 2>/dev/null || true
+            fi
+        done
+        
+        sleep 1
+        
+        # Force kill any remaining processes
+        for pid in "${pids[@]}"; do
+            if kill -0 "$pid" 2>/dev/null; then
+                echo "Force killing PID $pid..."
+                kill -9 "$pid" 2>/dev/null || true
+            fi
+        done
+        rm -f "$PID_FILE"
+    fi
+
+    # Kill specific processes if they're still running
+    for proc in "${processes_to_kill[@]}"; do
+        pkill -TERM "$proc" 2>/dev/null || true
+        sleep 0.5
+        pkill -9 "$proc" 2>/dev/null || true
+    done
+
+    # Stop docker compose last
+    echo "Stopping Docker containers..."
+    local docker_files=(
+        "$HOME/gq-gotrade-cpp/docker-compose.yml"
+        "$HOME/gq-gotrade-cpp/docker-compose-1.yml"
+        "$HOME/gotrade/docker-compose.db.yml"
+    )
+    
+    for file in "${docker_files[@]}"; do
+        if [ -f "$file" ]; then
+            echo "Bringing down containers from $file..."
+            docker compose -f "$file" down || true
+        fi
+    done
+
+    echo "All services have been stopped."
+}
+
+# -----------------------------------------------------------------------------
+# Main switch for OPERATION
+# -----------------------------------------------------------------------------
+case "$OPERATION" in
+
+  # -------------------------------------------------------------
+  # OPERATION: init => Install dependencies and Setup Conan Profile
+  # -------------------------------------------------------------
+  init)
+    echo "Installing dependencies (requires sudo if prompted)..."
+    sudo apt update
+    sudo apt install -y python3.12 python3.12-venv meson pkg-config cmake gdb valgrind unzip
+    sudo apt install python3.12-dev libpq-dev gcc
+    echo "Done installing dependencies."
+    curl -fsSL https://bun.sh/install | bash
+    echo "Setting up Conan profile..."
+    conan profile detect
+    mkdir -p ~/.conan2/profiles
+    cat > ~/.conan2/profiles/myprofile <<EOL
+[settings]
+os=Linux
+arch=x86_64
+compiler=gcc
+compiler.version=13
+compiler.cppstd=gnu17
+compiler.libcxx=libstdc++11
+build_type=Release
+
+[conf]
+tools.system.package_manager:mode=install
+tools.system.package_manager:sudo=True
+
+[buildenv]
+CC=/usr/bin/gcc
+CXX=/usr/bin/g++
+EOL
+
+    echo "Conan profile has been set in ~/.conan2/profiles/myprofile"
+    source "$HOME/.bashrc"
+    echo "Initilization setup Done"
+
+    ;;
+  
+  # -------------------------------------------------------------
+  # OPERATION: stop => Stop all services
+  # -------------------------------------------------------------
+  stop)
+    stop_all_services
+    ;;
+
+  auth)
+      generate_ssh_key
+    ;;
+  # -------------------------------------------------------------
+  # OPERATION: start => Start all services
+  # (Check dev mode conflicts, then fire up background processes)
+  # -------------------------------------------------------------
+  start)
+    # Disallow build-gq in remote-dev
+    if [[ "$DEV_MODE" == "remote-dev" && "$BUILD_GQ_PACKAGES" == "true" ]]; then
+      echo "Error: -g / --build-gq is NOT allowed in remote-dev mode."
+      exit 1
+    fi
+
+    if [[ -z "$DEV_MODE" ]]; then
+      echo "Warning: No dev mode specified. Defaulting to standard mode..."
+    else
+      echo "Starting services in '$DEV_MODE' mode..."
+    fi
+
+    if [[ "$DEV_MODE" == "remote-dev" && "$COMPILE_OEMS" == "true" ]]; then
+      run_oems
+      exit 0
+    fi
+
+    start_services
+    ;;
+
+  setup-gotrade)
+    setup_gotrade
+    ;;
+  compile)
+    run_oems
+    ;;
+  run)
+    run_oems
+    ;;
+  clone)
+    clone_repository "${REPO_NAMES[@]}"
+    ;;
+
+  # -------------------------------------------------------------
+  # Unknown OPERATION
+  # -------------------------------------------------------------
+  *)
+    echo "Invalid operation: $OPERATION"
+    usage
+    ;;
+esac
+
+exit 0
